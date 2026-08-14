@@ -1,3 +1,7 @@
-mcp>=1.9.0
+# mcp 2.0.0 (2026-07-28) removed mcp.server.fastmcp and renamed FastMCP to
+# MCPServer under mcp.server.mcpserver. This server targets the v1 API, so
+# the upper bound is required — without it pip resolves 2.x and the import
+# fails at startup with ModuleNotFoundError.
+mcp>=1.9.0,<2.0.0
 starlette>=0.37.0
 uvicorn>=0.30.0
