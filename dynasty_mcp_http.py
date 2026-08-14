@@ -28,12 +28,34 @@ import urllib.request
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Mount, Route
 
-mcp = FastMCP("dynasty", stateless_http=True)
+# FastMCP defaults host="127.0.0.1", and when transport_security is None and
+# host is localhost it AUTO-ENABLES DNS rebinding protection with a
+# localhost-only allowlist. Behind Render the Host header is the public
+# hostname, so every request 421s ("Invalid Host header") inside the SDK
+# middleware — before any handler or error logging runs. Pass the real
+# hostname so protection stays on but accepts legitimate traffic.
+_host = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "")
+_extra = [h.strip() for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()]
+_hosts = [h for h in ([_host] + _extra) if h]
+
+if _hosts:
+    _security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_hosts + [f"{h}:*" for h in _hosts],
+        allowed_origins=[f"https://{h}" for h in _hosts],
+    )
+else:
+    # No hostname available — fail open rather than 421 everything, but say so.
+    _security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+mcp = FastMCP("dynasty", stateless_http=True, host="0.0.0.0",
+              transport_security=_security)
 
 FP_KEY = os.environ.get("FANTASYPROS_API_KEY", "")
 MCP_SECRET = os.environ.get("MCP_SECRET", "")
@@ -361,5 +383,8 @@ app.add_middleware(LogErrors)
 if __name__ == "__main__":
     import uvicorn
     logging.basicConfig(level=logging.INFO)
+    logging.info("DNS-rebinding allowlist: %s",
+                 _hosts or "DISABLED (no RENDER_EXTERNAL_HOSTNAME/ALLOWED_HOSTS)")
+    logging.info("MCP mounted at /<MCP_SECRET>/mcp — health at /healthz")
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)),
                 log_level="info")
