@@ -17,6 +17,7 @@ Env vars (set in Render dashboard, NOT in code):
 """
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -306,10 +307,16 @@ def refresh_cache(what: str = "all") -> str:
 
 # ----------------------------------------------------------------- auth + app
 
+OPEN_PATHS = {"/healthz"}
+
+
 class BearerGate(BaseHTTPMiddleware):
-    """Optional second factor. The secret URL path is the primary gate."""
+    """Optional second factor. The secret URL path is the primary gate.
+
+    /healthz is exempt: Render's health checker cannot send the header, and a
+    401 there means the service never goes live."""
     async def dispatch(self, request, call_next):
-        if MCP_BEARER:
+        if MCP_BEARER and request.url.path not in OPEN_PATHS:
             got = request.headers.get("authorization", "")
             if not got.startswith("Bearer ") or not secrets.compare_digest(
                     got[7:], MCP_BEARER):
@@ -321,15 +328,38 @@ async def health(_):
     return PlainTextResponse("ok")
 
 
+class LogErrors(BaseHTTPMiddleware):
+    """Render showed a bare 500 with nothing in the logs. Surface the traceback."""
+    async def dispatch(self, request, call_next):
+        try:
+            return await call_next(request)
+        except Exception:
+            logging.exception("Unhandled error on %s %s",
+                              request.method, request.url.path)
+            raise
+
+
 if not MCP_SECRET or len(MCP_SECRET) < 24:
     raise SystemExit("MCP_SECRET must be set and at least 24 characters.")
 
-app = Starlette(routes=[
-    Route("/healthz", health),
-    Mount(f"/{MCP_SECRET}", app=mcp.streamable_http_app()),
-])
+# Starlette does NOT run the lifespan of a mounted sub-app. The MCP streamable
+# HTTP app starts its session manager in its lifespan, so without passing it
+# through, every MCP request hits an uninitialized task group and 500s while
+# /healthz keeps working. Hand the child's lifespan to the parent.
+mcp_app = mcp.streamable_http_app()
+
+app = Starlette(
+    routes=[
+        Route("/healthz", health),
+        Mount(f"/{MCP_SECRET}", app=mcp_app),
+    ],
+    lifespan=lambda _: mcp_app.router.lifespan_context(mcp_app),
+)
 app.add_middleware(BearerGate)
+app.add_middleware(LogErrors)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    logging.basicConfig(level=logging.INFO)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)),
+                log_level="info")
