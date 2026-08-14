@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: dynasty-mcp
+    runtime: python
+    plan: starter          # free tier sleeps after 15 min; see DEPLOY.md
+    buildCommand: pip install -r requirements.txt
+    startCommand: python dynasty_mcp_http.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: FANTASYPROS_API_KEY
+        sync: false        # set in dashboard, never in git
+      - key: MCP_SECRET
+        generateValue: true
+      - key: MCP_BEARER
+        generateValue: true
+      - key: SLEEPER_LEAGUE_ID
+        value: "1312003800977899520"
+      - key: MY_ROSTER_ID
+        value: "5"
+      - key: PYTHON_VERSION
+        value: "3.11"
