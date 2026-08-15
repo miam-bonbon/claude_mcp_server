@@ -1,10 +1,10 @@
 services:
   - type: web
-    name: dynasty-mcp
+    name: fantasy-mcp
     runtime: python
     plan: starter          # free tier sleeps after 15 min; see DEPLOY.md
     buildCommand: pip install -r requirements.txt
-    startCommand: python dynasty_mcp_http.py
+    startCommand: python fantasy_mcp_http.py
     healthCheckPath: /healthz
     envVars:
       - key: FANTASYPROS_API_KEY
@@ -13,8 +13,14 @@ services:
         generateValue: true
       - key: MCP_BEARER
         generateValue: true
+      # Default league when a tool is called without league_id.
       - key: SLEEPER_LEAGUE_ID
         value: "1312003800977899520"
+      # Preferred: resolves "me" by owner_id, so my_roster() works in ANY
+      # league you join without touching config. Username or numeric user_id.
+      - key: SLEEPER_USERNAME
+        sync: false
+      # Fallback "me" — only applies to SLEEPER_LEAGUE_ID above.
       - key: MY_ROSTER_ID
         value: "5"
       - key: PYTHON_VERSION
