@@ -218,6 +218,10 @@ def slim_players() -> dict:
         out[pid] = {"name": nm, "pos": p["position"], "team": p.get("team") or "FA",
                     "age": p.get("age"), "exp": p.get("years_exp"),
                     "inj": p.get("injury_status") or "", "body": p.get("injury_body_part") or "",
+                    # SORT KEY ONLY — never render this. It is Sleeper's internal
+                    # search_rank, not an ECR and not a positional rank. Printing it
+                    # next to a position label is exactly the ambiguity _rank_cols
+                    # exists to prevent.
                     "rank": p.get("search_rank") if p.get("search_rank") is not None else 999999}
     _MEMO["slim"], _MEMO["slim_at"] = out, now
     return out
@@ -276,6 +280,78 @@ def _fmt(p: dict, slot: str = "") -> str:
     if inj:
         line += f" {inj}"
     return line.rstrip()
+
+
+# --------------------------------------------------------------- rank plumbing
+
+POS_BOARDS = ("QB", "RB", "WR", "TE")
+
+
+def _board(position: str, ranking_type: str, scoring: str, season: int):
+    """One FantasyPros consensus board. Cache key includes position, so each
+    board caches independently under TTL['rankings']."""
+    return _fp(f"nfl/{season}/consensus-rankings",
+               {"position": position, "type": ranking_type,
+                "scoring": scoring, "experts": "show"},
+               cache_key=f"fp_{season}_{position}_{ranking_type}_{scoring}",
+               ttl=TTL["rankings"])
+
+
+def rank_maps(prof: dict, ranking_type: str, scoring: str, season: int,
+              positions=POS_BOARDS) -> tuple[dict, dict, list]:
+    """Fetch the overall board plus one board per position.
+
+    Returns (overall, pos_rank, warnings):
+      overall  : norm_name -> rank on this league's overall board (OP or ALL)
+      pos_rank : norm_name -> (position, rank) on that position's own board
+      warnings : notes for any board that failed to load
+
+    These are SEPARATE FantasyPros surveys, not one list sliced two ways, so
+    the two numbers will not always agree on ordering. That is expected.
+    Boards are fetched through the normal 1h rankings cache; a warm instance
+    makes zero network calls here. Never raises — a failed board yields a
+    warning and empty entries so callers can still render.
+    """
+    overall: dict = {}
+    pos_rank: dict = {}
+    warnings: list = []
+
+    for label, board_pos, sink in (
+            ("overall", prof["position"], "overall"),
+            *[(p, p, "pos") for p in positions]):
+        try:
+            data = _board(board_pos, ranking_type, scoring, season)
+        except Exception as exc:
+            warnings.append(f"{label} board unavailable ({type(exc).__name__})")
+            continue
+        for pl in data.get("players", []):
+            rk = pl.get("rank_ecr")
+            if rk is None:
+                continue
+            nm = norm_name(pl.get("player_name", ""))
+            if not nm:
+                continue
+            if sink == "overall":
+                overall.setdefault(nm, int(rk))
+            else:
+                pos_rank.setdefault(nm, (board_pos, int(rk)))
+    return overall, pos_rank, warnings
+
+
+def _rank_cols(ov, pr) -> str:
+    """Render the two rank columns so neither can be misread as the other.
+
+    Overall always carries the '#' prefix and the ' ovr' suffix; positional
+    rank is a single glued token (TE9). A bare integer is never emitted next
+    to a position label.
+    """
+    o = f"#{ov} ovr" if ov is not None else "#\u2014 ovr"
+    p = f"{pr[0]}{pr[1]}" if pr else "\u2014"
+    return f"{o:<9} {p:<7} "
+
+
+RANK_LEGEND = ("cols: #N ovr = overall rank on the {ov} board | "
+               "POSn = rank on that position's own board")
 
 
 # ----------------------------------------------------------------- tools
@@ -353,25 +429,43 @@ def league_settings(league_id: str = "") -> str:
 
 
 @mcp.tool()
-def my_roster(league_id: str = "") -> str:
+def my_roster(league_id: str = "", ranks: bool = True) -> str:
     """My team in the given league, resolved to names, grouped by position,
-    with IR/taxi slots and injury flags. Live from Sleeper."""
+    with IR/taxi slots, injury flags, and FantasyPros ranks. Live from Sleeper.
+
+    Injury strings here come from Sleeper's player map on a 24h cache and can
+    lag badly — confirm any injury independently before acting on it."""
     lid = _lid(league_id)
     rid = resolve_me(lid)
     if rid is None:
         return (f"Cannot tell which roster is mine in league {lid}. "
                 "Set SLEEPER_USERNAME in the environment, or call "
                 "team_roster(roster_id=N, league_id=...) directly.")
-    return team_roster(rid, lid)
+    return team_roster(rid, lid, ranks)
 
 
 @mcp.tool()
-def team_roster(roster_id: int, league_id: str = "") -> str:
-    """Resolved roster for any team in any league, by roster_id."""
+def team_roster(roster_id: int, league_id: str = "", ranks: bool = True) -> str:
+    """Resolved roster for any team in any league, by roster_id.
+
+    ranks=True (default) prefixes each player with overall and positional
+    FantasyPros rank. A rankings outage NEVER takes down the roster listing:
+    the rows render with em-dashes and a warning line instead."""
     lid = _lid(league_id)
     sp, users = slim_players(), league_users(lid)
     rosters = rosters_raw(lid)
     me = resolve_me(lid, rosters)
+
+    overall, pos_rank, warnings, prof = {}, {}, [], None
+    if ranks:
+        try:
+            prof = fp_profile(lid)
+            overall, pos_rank, warnings = rank_maps(
+                prof, prof["type"], prof["scoring"], prof["season"])
+        except Exception as exc:
+            warnings = [f"ranks unavailable ({type(exc).__name__}) — "
+                        "roster shown without them"]
+
     for r in rosters:
         if r["roster_id"] != roster_id:
             continue
@@ -384,14 +478,36 @@ def team_roster(roster_id: int, league_id: str = "") -> str:
                 stray.append(f"??? unresolved id {pid}")
             else:
                 typed.append((p, "IR" if pid in ir else ("TAXI" if pid in taxi else "")))
-        typed.sort(key=lambda x: (POS_ORDER.get(x[0]["pos"], 9), x[0]["rank"]))
+        # Within a position group, sort by positional rank so the printed
+        # column reads monotonically; search_rank only breaks ties for players
+        # no board covers, which pushes them to the bottom of their group.
+        def _key(x):
+            pr = pos_rank.get(norm_name(x[0]["name"]))
+            return (POS_ORDER.get(x[0]["pos"], 9),
+                    pr[1] if pr else 9999,
+                    x[0]["rank"])
+        typed.sort(key=_key)
+
         s = r.get("settings", {})
         head = (f"Roster {roster_id} — {users.get(r.get('owner_id'), '?')}"
                 f"{'  <-- me' if roster_id == me else ''}\n"
                 f"{s.get('wins',0)}-{s.get('losses',0)} · FAAB used {s.get('waiver_budget_used',0)}\n"
                 f"{len(players)} total | {len(ir)} IR | {len(taxi)} taxi | "
-                f"{len(players)-len(ir)-len(taxi)} active\n")
-        return head + "\n" + "\n".join(_fmt(p, sl) for p, sl in typed) + \
+                f"{len(players)-len(ir)-len(taxi)} active")
+        if ranks:
+            head += "\n" + RANK_LEGEND.format(ov=prof["position"] if prof else "OP")
+        for w in warnings:
+            head += f"\n  ! {w}"
+
+        body = []
+        for p, sl in typed:
+            if ranks:
+                nm = norm_name(p["name"])
+                body.append(_rank_cols(overall.get(nm), pos_rank.get(nm))
+                            + _fmt(p, sl))
+            else:
+                body.append(_fmt(p, sl))
+        return head + "\n\n" + "\n".join(body) + \
             ("\n" + "\n".join(stray) if stray else "")
     return f"No roster_id {roster_id} in league {lid}."
 
@@ -442,7 +558,11 @@ def trending(kind: str = "add", hours: int = 24, limit: int = 25) -> str:
     data = _fetch(f"{SLEEPER_BASE}/players/nfl/trending/{kind}"
                   f"?lookback_hours={hours}&limit={limit}",
                   cache_key=f"trend_{kind}_{hours}_{limit}", ttl=900)
-    return "\n".join(f"{e['count']:>7,}  {_fmt(sp[e['player_id']])}"
+    # Suffix is load-bearing: a bare integer immediately left of a position
+    # label reads as a rank. This number is a waiver count, not a rank.
+    verb = "adds" if kind == "add" else "drops"
+    return "\n".join(f"{'+' + format(e['count'], ',') + ' ' + verb:<16}"
+                     f"{_fmt(sp[e['player_id']])}"
                      for e in data if e["player_id"] in sp) or "None."
 
 
@@ -490,56 +610,94 @@ def fp_injuries() -> str:
 @mcp.tool()
 def roster_vs_rankings(roster_id: int = 0, league_id: str = "",
                        position: str = "", ranking_type: str = "",
-                       scoring: str = "", season: int = 0) -> str:
+                       scoring: str = "", season: int = 0,
+                       group_by_position: bool = False) -> str:
     """THE MAIN TOOL. Joins a live Sleeper roster to live FantasyPros consensus
     by normalized name, using the ranking set derived from that league's own
-    format and scoring. Shows ECR per player and flags anyone outside consensus."""
+    format and scoring.
+
+    Every player gets TWO numbers: overall rank on the league's overall board
+    (rendered '#88 ovr') and rank on that player's own positional board
+    (rendered 'TE9'). They come from different FantasyPros surveys, so their
+    orderings will sometimes disagree — that is not a bug.
+
+    position: FILTERS the roster to that position (QB RB WR TE K DEF).
+      It does NOT change which board is used; both boards are always fetched.
+    group_by_position: emit one block per position instead of one overall-
+      sorted list. Better for 'how is my TE room', worse for cross-position
+      trade comparison."""
     lid = _lid(league_id)
     prof = fp_profile(lid)
-    position = position or prof["position"]
     ranking_type = ranking_type or prof["type"]
     scoring = scoring or prof["scoring"]
     season = season or prof["season"]
+    pos_filter = (position or "").strip().upper()
+    if pos_filter in ("", "ALL", "OP", "FLX"):
+        pos_filter = ""
 
     rosters = rosters_raw(lid)
     rid = roster_id or resolve_me(lid, rosters)
     if rid is None:
         return (f"Cannot tell which roster is mine in league {lid}. "
                 "Pass roster_id, or set SLEEPER_USERNAME.")
-
-    sp = slim_players()
-    fp = _fp(f"nfl/{season}/consensus-rankings",
-             {"position": position, "type": ranking_type,
-              "scoring": scoring, "experts": "show"},
-             cache_key=f"fp_{season}_{position}_{ranking_type}_{scoring}",
-             ttl=TTL["rankings"])
-    idx = {norm_name(p.get("player_name", "")): p for p in fp.get("players", [])}
-
     target = next((r for r in rosters if r["roster_id"] == rid), None)
     if not target:
         return f"No roster_id {rid} in league {lid}."
+
+    sp = slim_players()
+    overall, pos_rank, warnings = rank_maps(prof, ranking_type, scoring, season)
     ir, taxi = set(target.get("reserve") or []), set(target.get("taxi") or [])
 
-    ranked, unranked = [], []
+    rows, nowhere, stray = [], [], []
     for pid in target.get("players") or []:
         p = sp.get(pid)
         if not p:
-            unranked.append(f"     unresolved sleeper id {pid}")
+            stray.append(f"     unresolved sleeper id {pid}")
+            continue
+        if pos_filter and p["pos"] != pos_filter:
             continue
         slot = "IR" if pid in ir else ("TAXI" if pid in taxi else "")
-        m = idx.get(norm_name(p["name"]))
-        if m:
-            ranked.append((float(m.get("rank_ecr") or 9999), p, slot))
+        nm = norm_name(p["name"])
+        ov, pr = overall.get(nm), pos_rank.get(nm)
+        if ov is None and pr is None:
+            nowhere.append("     " + _fmt(p, slot))
         else:
-            unranked.append("     " + _fmt(p, slot))
-    ranked.sort(key=lambda x: x[0])
+            rows.append((ov, pr, p, slot))
+
+    def line(ov, pr, p, sl):
+        return _rank_cols(ov, pr) + _fmt(p, sl)
 
     out = [_profile_header(prof),
-           f"Roster {rid} vs FantasyPros {ranking_type} {position} {scoring} {season}",
-           ""]
-    out += [f"{int(rk):>4}  {_fmt(p, sl)}" for rk, p, sl in ranked]
-    if unranked:
-        out += ["", f"UNRANKED / outside consensus ({len(unranked)}):"] + unranked
+           f"Roster {rid} vs FantasyPros {ranking_type} {scoring} {season}"
+           + (f" — {pos_filter} only" if pos_filter else ""),
+           RANK_LEGEND.format(ov=prof["position"])]
+    for w in warnings:
+        out.append(f"  ! {w}")
+    out.append("")
+
+    if group_by_position:
+        for grp in sorted({p["pos"] for _, _, p, _ in rows},
+                          key=lambda x: POS_ORDER.get(x, 9)):
+            block = [r for r in rows if r[2]["pos"] == grp]
+            block.sort(key=lambda r: (r[1][1] if r[1] else 9999,
+                                      r[0] if r[0] is not None else 9999))
+            out.append(f"{grp} ({len(block)})")
+            out += ["  " + line(*r) for r in block]
+            out.append("")
+    else:
+        rows.sort(key=lambda r: (r[0] if r[0] is not None else 99999,
+                                 POS_ORDER.get(r[2]["pos"], 9),
+                                 r[1][1] if r[1] else 9999))
+        out += [line(*r) for r in rows]
+
+    # Split deliberately: ranked-nowhere is the bucket most likely to contain a
+    # norm_name() mismatch (FP ranks him, the string just did not line up), and
+    # that failure is otherwise silent. Missing from ONE board is normal depth.
+    if nowhere:
+        out += ["", f"ON NO BOARD ({len(nowhere)}) — genuinely unranked, or a "
+                    "name-match failure; verify before dismissing:"] + nowhere
+    if stray:
+        out += ["", f"UNRESOLVED SLEEPER IDS ({len(stray)}):"] + stray
     return "\n".join(out)
 
 
@@ -584,10 +742,12 @@ def draft_board(league_id: str = "", limit: int = 60) -> str:
 @mcp.tool()
 def refresh_cache(what: str = "all") -> str:
     """Force-refresh cached data.
-    what: all | rosters | rankings | players | league | draft."""
-    pats = {"all": "*", "rosters": "rosters_*", "rankings": "fp_*",
+    what: all | rosters | rankings | players | league | draft | injuries."""
+    # "rankings" globs fp_{season}_* so it no longer also nukes fp_injuries,
+    # which lives on a much shorter TTL and is expensive to lose.
+    pats = {"all": "*", "rosters": "rosters_*", "rankings": "fp_2*",
             "players": "sleeper_players*", "league": "league_*",
-            "draft": "draft*"}
+            "draft": "draft*", "injuries": "fp_injuries*"}
     n = 0
     for f in CACHE_DIR.glob(pats.get(what, "*")):
         f.unlink()
