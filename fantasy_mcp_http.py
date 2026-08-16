@@ -600,6 +600,96 @@ def scan_unmatched(league_id: str = "") -> tuple[int, int, list, list]:
 
 
 @mcp.tool()
+def pick_landscape(league_id: str = "", seasons: str = "") -> str:
+    """Who owns which future rookie picks, from Sleeper's traded_picks endpoint.
+
+    Sleeper does NOT put picks in the roster object, so this is the only
+    source. The endpoint returns only picks that have MOVED; everything else
+    is still held by its original owner, so full ownership is derived by
+    starting from the default grid and applying the trades.
+
+    A pick keeps its origin forever: 'roster 4's 2027 1st' stays identifiable
+    after any number of hands. Multi-hop trades are resolved by following the
+    chain from the original owner, so the current holder is correct even when
+    a pick moved several times.
+
+    seasons: comma-separated, e.g. "2027,2028". Defaults to the two seasons
+    after the current one."""
+    lid = _lid(league_id)
+    lg = league_meta(lid)
+    users = league_users(lid)
+    rosters = rosters_raw(lid)
+    rids = sorted(r["roster_id"] for r in rosters)
+    owner_of = {r["roster_id"]: str(users.get(r.get("owner_id"), "?"))
+                for r in rosters}
+
+    cur = int(lg.get("season") or 2026)
+    if seasons.strip():
+        want = [s.strip() for s in seasons.split(",") if s.strip()]
+    else:
+        want = [str(cur + 1), str(cur + 2)]
+
+    rounds = int((lg.get("settings") or {}).get("draft_rounds") or 4)
+
+    # Pull this league and, for dynasty rollovers, the previous league — a
+    # future pick traded last season may still be recorded under the old id.
+    sources, traded, notes = [(lid, "current")], [], []
+    prev = lg.get("previous_league_id")
+    if prev:
+        sources.append((prev, "previous"))
+    for src_id, label in sources:
+        try:
+            rows = _fetch(f"{SLEEPER_BASE}/league/{src_id}/traded_picks",
+                          cache_key=f"picks_{src_id}", ttl=TTL["roster"])
+            for row in rows or []:
+                row["_src"] = label
+            traded += rows or []
+        except Exception as exc:
+            notes.append(f"{label} league picks unavailable ({type(exc).__name__})")
+
+    def holder(season: str, rnd: int, origin: int) -> int:
+        """Follow the trade chain from the original owner to the current one."""
+        who, seen = origin, 0
+        while seen < 24:
+            nxt = next((t for t in traded
+                        if str(t.get("season")) == season
+                        and int(t.get("round") or 0) == rnd
+                        and int(t.get("roster_id") or 0) == origin
+                        and int(t.get("previous_owner_id") or 0) == who
+                        and int(t.get("owner_id") or 0) != who), None)
+            if not nxt:
+                return who
+            who, seen = int(nxt["owner_id"]), seen + 1
+        return who
+
+    held = {rid: [] for rid in rids}
+    for season in want:
+        for rnd in range(1, rounds + 1):
+            for origin in rids:
+                cur_owner = holder(season, rnd, origin)
+                held.setdefault(cur_owner, []).append((season, rnd, origin))
+
+    out = [f"PICK LANDSCAPE — {lg.get('name','?')} · seasons {', '.join(want)} "
+           f"· {rounds} rookie rounds"]
+    for n in notes:
+        out.append(f"  ! {n}")
+    out.append(f"{len(traded)} traded-pick records; everything else sits with "
+               "its original owner")
+    out.append("")
+    for rid in rids:
+        picks = sorted(held.get(rid, []))
+        own = sum(1 for s, r, o in picks if o == rid)
+        firsts = [f"{s} 1st ({'own' if o == rid else f'r{o}'})"
+                  for s, r, o in picks if r == 1]
+        out.append(f"{rid:>2} {owner_of.get(rid,'?')[:22]:<23}"
+                   f"{len(picks):>2} picks ({own} own) | "
+                   + (", ".join(firsts) if firsts else "no firsts"))
+    out += ["", "Rounds 2-4 omitted from the summary above; ask for a season "
+                "to see the full grid."]
+    return "\n".join(out)
+
+
+@mcp.tool()
 def unmatched(league_id: str = "") -> str:
     """NAME-MATCH AUDIT. Every rostered player in the league that no
     FantasyPros board ranks. Run this after waiver day and after any trade.
