@@ -820,15 +820,79 @@ def fp_rankings(league_id: str = "", position: str = "", ranking_type: str = "",
             f"{len(pls)} ranked, showing {min(limit,len(pls))}\n" + "\n".join(rows))
 
 
+# The injuries endpoint does NOT share the rankings response shape. It
+# returns its array under "injuries", not "players", and the per-player keys
+# are bare: name / position_id / team_id / status, not player_name /
+# player_position_id / player_team_id / injury_status. Reading it with the
+# rankings keys yields an empty list on every call, which the old `or "No
+# data."` reported as an outage for months. Verified against live JSON
+# 2026-08-16.
+#
+# Confirmed query-param behaviour — do not "improve" this:
+#   no params              -> 114 entries (37 PUP, 69 IR, 8 OUT)  <-- correct
+#   ?season=&week=1        -> byte-identical to no params
+#   ?season=&week=0|draft  -> 11 entries, 9 of them retired players
+# week=draft is NOT the offseason value; passing it makes the feed worse.
+
+# Worst first, so the lines that matter sit at the top.
+_INJ_ORDER = {"OUT": 0, "IR": 1, "PUP": 2, "DOUBTFUL": 3,
+              "QUESTIONABLE": 4, "PROBABLE": 5}
+_INJ_SKILL = ("QB", "RB", "WR", "TE")
+
+
 @mcp.tool()
-def fp_injuries() -> str:
-    """Live FantasyPros NFL injury report."""
+def fp_injuries(positions: str = "SKILL", include_retired: bool = False) -> str:
+    """Live FantasyPros NFL injury report.
+
+    positions: "SKILL" (QB/RB/WR/TE, the default), "ALL", or a comma-separated
+      list such as "RB,WR". The feed is league-wide and includes IDP — only 44
+      of 114 entries were skill positions on 2026-08-16, so ALL is mostly noise
+      for a league with no kickers or defenses.
+    include_retired: the feed carries retired players as OUT with
+      comment="retired" (Russell Wilson, Thielen). Off by default.
+
+    CAVEAT: the response carries "public_api_limited": true, and as of
+    2026-08-16 there were no QUESTIONABLE/DOUBTFUL entries and every
+    probability_of_playing was null. That is consistent with preseason (no
+    practice reports exist yet) OR with the public tier stripping them.
+    Re-test in Week 1 before trusting this for game-day status.
+    """
     data = _fp("nfl/injuries", {}, cache_key="fp_injuries", ttl=TTL["injuries"])
-    return "\n".join(
-        f"{(p.get('player_name') or '')[:24]:<25}{(p.get('player_position_id') or ''):<4}"
-        f"{(p.get('player_team_id') or ''):<5}"
-        f"{p.get('injury_status','')} {p.get('injury_details','')}"[:60]
-        for p in data.get("players", [])[:200]) or "No data."
+    rows = data.get("injuries", [])
+    if not rows:
+        return (f"fp_injuries: request succeeded but the injuries list was "
+                f"empty (count={data.get('count')}, keys={sorted(data)[:8]}). "
+                f"Not a request failure — check the response shape.")
+
+    want = positions.strip().upper()
+    if want == "SKILL":
+        keep = set(_INJ_SKILL)
+    elif want == "ALL":
+        keep = None
+    else:
+        keep = {p.strip().upper() for p in positions.split(",") if p.strip()}
+
+    sel = [p for p in rows
+           if (keep is None or p.get("position_id") in keep)
+           and (include_retired or p.get("comment") != "retired")]
+    sel.sort(key=lambda p: (_INJ_ORDER.get((p.get("status") or "").upper(), 9),
+                            p.get("position_id") or "", p.get("name") or ""))
+
+    if not sel:
+        return f"No injuries matching positions={positions} ({len(rows)} in feed)."
+
+    out = [f"FANTASYPROS INJURIES — {len(sel)} of {len(rows)} · positions={positions}"]
+    for p in sel[:200]:
+        detail = p.get("injury_type") or p.get("comment") or ""
+        prob = p.get("probability_of_playing")
+        out.append(
+            f"  {(p.get('status') or '?'):<4}{(p.get('position_id') or '??'):<4}"
+            f"{(p.get('name') or '')[:26]:<27}{(p.get('team_id') or ''):<4}"
+            f"{detail[:26]:<27}{(p.get('injury_update_date') or '')[:10]}"
+            + (f"  {prob}%" if prob is not None else ""))
+    if data.get("public_api_limited"):
+        out.append("  (public_api_limited=true — feed may be a subset)")
+    return "\n".join(out)
 
 
 @mcp.tool()
