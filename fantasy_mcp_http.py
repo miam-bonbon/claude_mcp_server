@@ -109,13 +109,27 @@ def _fp(path: str, params: dict, cache_key: str, ttl: int):
 
 SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
 
+# Sleeper and FantasyPros calling one player genuinely DIFFERENT names —
+# nicknames, not formatting. norm_name already handles suffixes, apostrophes,
+# periods and hyphens; no normalization could bridge Marquise -> Hollywood.
+#
+# Applied to BOTH sides, so this canonicalises rather than translates: if
+# either source later switches to the other name, both still collapse to the
+# same key. Keys and values are post-normalization (lowercase, no punctuation,
+# no spaces). Add entries only after confirming against the position board —
+# run unmatched() to find candidates.
+NAME_ALIASES = {
+    "marquisebrown": "hollywoodbrown",
+}
+
 
 def norm_name(name: str) -> str:
     if not name:
         return ""
     s = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
     s = s.lower().replace("'", "").replace(".", "").replace("-", " ")
-    return "".join(p for p in re.split(r"\s+", s) if p and p not in SUFFIXES)
+    s = "".join(p for p in re.split(r"\s+", s) if p and p not in SUFFIXES)
+    return NAME_ALIASES.get(s, s)
 
 
 # ----------------------------------------------------------------- league layer
@@ -513,9 +527,13 @@ def team_roster(roster_id: int, league_id: str = "", ranks: bool = True) -> str:
 
 
 @mcp.tool()
-def league_overview(league_id: str = "") -> str:
+def league_overview(league_id: str = "", check_names: bool = True) -> str:
     """One line per team: manager, record, roster size, and positional counts.
-    Spots positional scarcity across the league."""
+    Spots positional scarcity across the league.
+
+    check_names=True appends a name-match footer. This is deliberate: a
+    name-match failure is silent and self-concealing, so the alarm belongs in
+    a tool that gets called anyway rather than one someone must remember."""
     lid = _lid(league_id)
     sp, users = slim_players(), league_users(lid)
     rosters = sorted(rosters_raw(lid), key=lambda x: x["roster_id"])
@@ -533,6 +551,86 @@ def league_overview(league_id: str = "") -> str:
         out.append(f"{r['roster_id']:>2} {str(users.get(r.get('owner_id'),'?'))[:24]:<25}"
                    f"{s.get('wins',0)}-{s.get('losses',0)}  {len(pl):>2}p "
                    f"{n['QB']:>2}QB {n['RB']:>2}RB {n['WR']:>2}WR {n['TE']:>2}TE{mark}")
+
+    if check_names:
+        try:
+            total, matched, rows, warnings = scan_unmatched(lid)
+            if warnings:
+                out.append(f"\nname match: skipped, {len(warnings)} board(s) "
+                           "unavailable")
+            elif rows:
+                out.append(f"\nname match: {matched}/{total} matched · "
+                           f"{len(rows)} on no board — run unmatched() to see "
+                           "who, some may be nickname mismatches worth real value")
+            else:
+                out.append(f"\nname match: {total}/{total} matched")
+        except Exception as exc:
+            out.append(f"\nname match: check failed ({type(exc).__name__})")
+    return "\n".join(out)
+
+
+def scan_unmatched(league_id: str = "") -> tuple[int, int, list, list]:
+    """Walk every roster in the league and find players no board ranks.
+
+    Returns (total, matched, rows, warnings) where rows are
+    (roster_id, owner, player) tuples. Cheap on a warm cache: the boards,
+    player map and rosters are all already loaded by other calls."""
+    lid = _lid(league_id)
+    sp, users = slim_players(), league_users(lid)
+    rosters = rosters_raw(lid)
+    prof = fp_profile(lid)
+    overall, pos_rank, warnings = rank_maps(
+        prof, prof["type"], prof["scoring"], prof["season"])
+
+    total = matched = 0
+    rows = []
+    for r in sorted(rosters, key=lambda x: x["roster_id"]):
+        for pid in r.get("players") or []:
+            p = sp.get(pid)
+            if not p:
+                continue
+            total += 1
+            nm = norm_name(p["name"])
+            if nm in overall or nm in pos_rank:
+                matched += 1
+            else:
+                rows.append((r["roster_id"],
+                             str(users.get(r.get("owner_id"), "?")), p))
+    return total, matched, rows, warnings
+
+
+@mcp.tool()
+def unmatched(league_id: str = "") -> str:
+    """NAME-MATCH AUDIT. Every rostered player in the league that no
+    FantasyPros board ranks. Run this after waiver day and after any trade.
+
+    Two different causes land here and this tool CANNOT tell them apart:
+      1. Consensus genuinely does not rank him — fine, ignore.
+      2. A name-match failure — FP ranks him under a different name, so he
+         silently reads as worthless. Sleeper's "Marquise Brown" is FP's
+         "Hollywood Brown"; that one cost a real WR108 until it was found.
+
+    Check each name against its position board via fp_rankings before
+    dismissing it. Confirmed nicknames go in NAME_ALIASES in this file."""
+    lid = _lid(league_id)
+    try:
+        total, matched, rows, warnings = scan_unmatched(lid)
+    except Exception as exc:
+        return f"Name-match audit failed ({type(exc).__name__}): {exc}"
+
+    lg = league_meta(lid)
+    out = [f"NAME-MATCH AUDIT — {lg.get('name','?')}"]
+    if warnings:
+        out += [f"  ! {w}" for w in warnings]
+        out.append("  ! COUNT BELOW IS INFLATED BY THE ABOVE — do not act on it")
+    out.append(f"{total} rostered · {matched} matched · {len(rows)} on no board")
+    out.append("")
+    if not rows:
+        out.append("Every rostered player matched a board.")
+        return "\n".join(out)
+    out += [f"{rid:>2} {owner[:20]:<21}{_fmt(p)}" for rid, owner, p in rows]
+    out += ["", "Verify each against fp_rankings(position=...) before "
+                "assuming unranked."]
     return "\n".join(out)
 
 
