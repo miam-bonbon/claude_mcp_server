@@ -648,19 +648,36 @@ def pick_landscape(league_id: str = "", seasons: str = "") -> str:
             notes.append(f"{label} league picks unavailable ({type(exc).__name__})")
 
     def holder(season: str, rnd: int, origin: int) -> int:
-        """Follow the trade chain from the original owner to the current one."""
-        who, seen = origin, 0
-        while seen < 24:
-            nxt = next((t for t in traded
-                        if str(t.get("season")) == season
-                        and int(t.get("round") or 0) == rnd
-                        and int(t.get("roster_id") or 0) == origin
-                        and int(t.get("previous_owner_id") or 0) == who
-                        and int(t.get("owner_id") or 0) != who), None)
-            if not nxt:
-                return who
-            who, seen = int(nxt["owner_id"]), seen + 1
-        return who
+        """Current owner of the pick originally belonging to `origin`.
+
+        Sleeper's `owner_id` is ALREADY the current holder, so the old
+        chain-walk from previous_owner_id bought nothing and could fail
+        silently: if Sleeper stores one row per pick (updating
+        previous_owner_id to the most recent prior owner) rather than one row
+        per hop, a twice-traded pick has no row pointing back to the original
+        owner, the walk finds nothing on step one, and the pick is reported as
+        never having moved.
+
+        This resolves without assuming either storage model. Rows from the
+        current league win over rows carried in from previous_league_id, since
+        a rollover can leave a stale copy of the same pick. Among the winners,
+        the current holder is the owner_id that is nobody else's
+        previous_owner_id — the terminal node — which is the final owner under
+        per-hop storage and the only owner under per-pick storage.
+        """
+        rows = [t for t in traded
+                if str(t.get("season")) == season
+                and int(t.get("round") or 0) == rnd
+                and int(t.get("roster_id") or 0) == origin]
+        if not rows:
+            return origin
+        rows = [t for t in rows if t.get("_src") == "current"] or rows
+        owners = {int(t.get("owner_id") or 0) for t in rows}
+        prevs = {int(t.get("previous_owner_id") or 0) for t in rows}
+        terminal = owners - prevs
+        if len(terminal) == 1:
+            return terminal.pop()
+        return int(rows[-1].get("owner_id") or origin)
 
     held = {rid: [] for rid in rids}
     for season in want:
@@ -676,16 +693,35 @@ def pick_landscape(league_id: str = "", seasons: str = "") -> str:
     out.append(f"{len(traded)} traded-pick records; everything else sits with "
                "its original owner")
     out.append("")
+
+    # One season requested -> full round-by-round grid. More than one -> firsts
+    # only, or the block becomes unreadable. The old code advertised the grid
+    # in its footer but hardcoded `if r == 1`, so no argument ever produced it.
+    single = len(want) == 1
+
     for rid in rids:
         picks = sorted(held.get(rid, []))
         own = sum(1 for s, r, o in picks if o == rid)
-        firsts = [f"{s} 1st ({'own' if o == rid else f'r{o}'})"
-                  for s, r, o in picks if r == 1]
-        out.append(f"{rid:>2} {owner_of.get(rid,'?')[:22]:<23}"
-                   f"{len(picks):>2} picks ({own} own) | "
-                   + (", ".join(firsts) if firsts else "no firsts"))
-    out += ["", "Rounds 2-4 omitted from the summary above; ask for a season "
-                "to see the full grid."]
+        head = (f"{rid:>2} {owner_of.get(rid,'?')[:22]:<23}"
+                f"{len(picks):>2} picks ({own} own)")
+        if not single:
+            firsts = [f"{s} 1st ({'own' if o == rid else f'r{o}'})"
+                      for s, r, o in picks if r == 1]
+            out.append(head + " | " + (", ".join(firsts) if firsts
+                                       else "no firsts"))
+            continue
+        out.append(head)
+        for rnd in range(1, rounds + 1):
+            origins = sorted(o for s, r, o in picks if r == rnd)
+            if not origins:
+                out.append(f"     R{rnd}  —")
+                continue
+            tags = ", ".join("own" if o == rid else f"r{o}" for o in origins)
+            out.append(f"     R{rnd}  {len(origins)}x  ({tags})")
+
+    if not single:
+        out += ["", "Firsts only. Call with a single season "
+                    "(seasons=\"2027\") for the full round-by-round grid."]
     return "\n".join(out)
 
 
