@@ -812,12 +812,33 @@ def fp_rankings(league_id: str = "", position: str = "", ranking_type: str = "",
                cache_key=f"fp_{season}_{position}_{ranking_type}_{scoring}",
                ttl=TTL["rankings"])
     pls = data.get("players", [])
-    rows = [f"{str(p.get('rank_ecr','?')):>4}  {(p.get('player_name') or '')[:24]:<25}"
-            f"{(p.get('player_position_id') or ''):<4}{(p.get('player_team_id') or ''):<5}"
-            f"ecr {p.get('rank_ave','?')}" for p in pls[:limit]]
-    return (f"{_profile_header(prof)}\n"
+
+    # Projected points riding along in the rankings payload. The exact key
+    # name isn't pinned down yet, so surface any numeric field whose name
+    # says points/projection, and print the response's scoring label next to
+    # it. Once the key is confirmed against live JSON, narrow this down.
+    proj_keys = sorted({k for p in pls[:25] for k, v in p.items()
+                        if re.search(r"pts|proj|point", k, re.I)
+                        and _num(v) is not None})
+
+    def _row(p):
+        line = (f"{str(p.get('rank_ecr','?')):>4}  {(p.get('player_name') or '')[:24]:<25}"
+                f"{(p.get('player_position_id') or ''):<4}{(p.get('player_team_id') or ''):<5}"
+                f"ecr {p.get('rank_ave','?')}")
+        extra = [f"{k}={_num(p.get(k)):.1f}" for k in proj_keys
+                 if _num(p.get(k)) is not None]
+        return line + ("  " + " ".join(extra) if extra else "")
+
+    rows = [_row(p) for p in pls[:limit]]
+    label = str(data.get("scoring") or "?").upper()
+    head = (f"{_profile_header(prof)}\n"
             f"FantasyPros {ranking_type} {position} {scoring} {season} — "
-            f"{len(pls)} ranked, showing {min(limit,len(pls))}\n" + "\n".join(rows))
+            f"{len(pls)} ranked, showing {min(limit,len(pls))}\n"
+            f"response scoring label: {label} · projection fields: "
+            + (", ".join(proj_keys) if proj_keys else "none in payload"))
+    if pls:
+        head += "\n  player keys: " + ", ".join(sorted(pls[0].keys()))
+    return head + "\n" + "\n".join(rows)
 
 
 # The injuries endpoint does NOT share the rankings response shape. It
@@ -1150,13 +1171,38 @@ _PROJ_NO_PPR_FIELD = {"QB", "K", "DST"}
 _PROJ_ALL = "QB:RB:WR:TE:K:DST"
 
 
+# The response-level `scoring` label is NOT the PPR guarantee. FantasyPros
+# tags the projections payload with its default ("STD") even though every
+# player row still carries points / points_half / points_ppr. Refusing on the
+# label threw away correct PPR numbers (Week 6, 2026). The guarantee lives
+# per player instead:
+#   1. RB/WR/TE read points_ppr only — missing -> ERR, never standard.
+#   2. When points and rec_rec are both present, points_ppr must equal
+#      points + 1.0 x receptions (within rounding). A row that fails the
+#      arithmetic is shown as ERR, so a mislabelled half/std value can't leak.
+_PPR_TOL = 0.2
+
+
+def _num(v):
+    try:
+        return float(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _proj_points(pos: str, stats: dict):
-    """(value, ok). Never falls back to standard points for a pass catcher."""
-    if stats.get("points_ppr") is not None:
-        return float(stats["points_ppr"]), True
-    if pos in _PROJ_NO_PPR_FIELD and stats.get("points") is not None:
-        return float(stats["points"]), True
-    return None, False
+    """(value, ok, why). Never falls back to standard points for a pass catcher."""
+    ppr = _num(stats.get("points_ppr"))
+    if ppr is not None:
+        if pos not in _PROJ_NO_PPR_FIELD:
+            std, rec = _num(stats.get("points")), _num(stats.get("rec_rec"))
+            if std is not None and rec is not None and abs(ppr - std - rec) > _PPR_TOL:
+                return None, False, (f"points_ppr {ppr:.1f} != points {std:.1f} "
+                                     f"+ {rec:.1f} rec — failed PPR check")
+        return ppr, True, ""
+    if pos in _PROJ_NO_PPR_FIELD and _num(stats.get("points")) is not None:
+        return _num(stats["points"]), True, ""
+    return None, False, "no points_ppr in response — not shown as STD"
 
 
 def _proj_line(pos: str, s: dict) -> str:
@@ -1193,7 +1239,8 @@ def fp_projections(players: str = "", position: str = "", week: int = 0,
     limit   : rows per position when listing a whole position.
 
     Points are points_ppr (QB/K/DST use points — no receptions involved).
-    The response's scoring is verified to be PPR or the tool refuses to answer."""
+    Each RB/WR/TE value is checked as points + 1.0 x receptions; a row that
+    fails the check, or has no points_ppr, shows ERR — never a standard number."""
     pos_param = (position or "").strip().upper() or _PROJ_ALL
     if season <= 0:
         try:
@@ -1203,7 +1250,7 @@ def fp_projections(players: str = "", position: str = "", week: int = 0,
 
     # One request per position via the documented `position` param (default
     # there is RB, so a missed param would silently return only RBs).
-    raw, failed, wk = [], [], week or "current"
+    raw, failed, wk, labels = [], [], week or "current", set()
     for grp in [g for g in pos_param.split(":") if g]:
         params = {"scoring": PROJ_SCORING, "position": grp}
         if week > 0:
@@ -1215,11 +1262,11 @@ def fp_projections(players: str = "", position: str = "", week: int = 0,
         except Exception as exc:
             failed.append(f"{grp} ({type(exc).__name__}: {exc})")
             continue
+        # Label only — logged, not trusted, not a reason to refuse. The
+        # per-player PPR check in _proj_points is what keeps numbers honest.
         got = str(data.get("scoring") or "").upper()
         if got and got != PROJ_SCORING:
-            return (f"fp_projections: REFUSED — asked for {PROJ_SCORING}, API "
-                    f"returned scoring={got} for {grp}. No numbers shown rather "
-                    "than wrong ones.")
+            labels.add(f"{grp}={got}")
         wk = data.get("week", wk)
         for p in data.get("players", []) or []:
             p.setdefault("_pos", grp)
@@ -1234,19 +1281,24 @@ def fp_projections(players: str = "", position: str = "", week: int = 0,
         name = p.get("name") or p.get("player_name") or ""
         team = p.get("team_id") or p.get("player_team_id") or ""
         stats = p.get("stats") or {}
-        pts, ok = _proj_points(pos, stats)
+        pts, ok, why = _proj_points(pos, stats)
         rows.append({"name": name, "nm": norm_name(name), "pos": pos,
-                     "team": team, "pts": pts, "ok": ok,
+                     "team": team, "pts": pts, "ok": ok, "why": why,
                      "line": _proj_line(pos, stats)})
 
     head = (f"FANTASYPROS PROJECTIONS · week {wk} · {season} · "
-            f"scoring {PROJ_SCORING} (points_ppr) · {len(rows)} players")
+            f"scoring {PROJ_SCORING} (points_ppr, per-player checked) · "
+            f"{len(rows)} players")
+    if labels:
+        head += ("\n  note: API labelled response scoring "
+                 + ", ".join(sorted(labels))
+                 + " — values shown are points_ppr only")
     if failed:
         head += "\n  ! positions unavailable: " + "; ".join(failed)
 
     def fmt(r):
         val = f"{r['pts']:5.1f}" if r["ok"] else "  ERR"
-        tail = r["line"] if r["ok"] else "no points_ppr in response — not shown as STD"
+        tail = r["line"] if r["ok"] else r["why"]
         return f"{val}  {r['pos']:<3} {r['name'][:24]:<25}{r['team']:<4} {tail}"
 
     if players.strip():
