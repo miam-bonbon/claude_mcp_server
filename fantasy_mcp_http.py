@@ -1135,6 +1135,14 @@ def youtube_transcript(url_or_id: str, start: str = "", end: str = "",
     return head + "\n\n" + ("\n".join(lines) or "Nothing in that window.")
 
 
+# ----------------------------------------------------------------- espn
+
+# MORPHEUS is on ESPN. espn_matchup / espn_roster live in espn_tools.py and
+# must be registered before mcp.streamable_http_app() is built below.
+from espn_tools import register_espn_tools
+register_espn_tools(mcp)
+
+
 # ----------------------------------------------------------------- auth + app
 
 OPEN_PATHS = {"/healthz"}

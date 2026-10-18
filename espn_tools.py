@@ -1,26 +1,31 @@
 """
-ESPN read path for your_own_fantasy_connector.
+ESPN read path for the fantasy MCP server (MORPHEUS lives on ESPN).
 
-Adds two MCP tools:
-  espn_matchup(league_id, team_id, week=0)  -> both full rosters for the matchup,
-                                               lineup slots, injury status, ESPN projections
-  espn_roster(league_id, team_id, week=0)   -> one team's roster, same detail
+Tools:
+  espn_matchup(league_id, team_id, week=0) -> my roster AND this week's opponent,
+                                              lineup slots, injuries, ESPN projections, live points
+  espn_roster(league_id, team_id, week=0)  -> one team, same detail
 
-Private leagues need two cookies, set as Render environment variables:
-  ESPN_S2   (long string, cookie "espn_s2")
-  ESPN_SWID (looks like {XXXXXXXX-XXXX-...}, cookie "SWID", keep the braces)
+Env vars (Render dashboard):
+  ESPN_S2     cookie "espn_s2"   (required for private leagues)
+  ESPN_SWID   cookie "SWID"      (keep the curly braces)
+  ESPN_SEASON optional, default 2026
 
-Wiring, in fantasy_mcp_http.py after `mcp` is created:
-    from espn_tools import register_espn_tools
-    register_espn_tools(mcp)
+Stdlib only (urllib), same as the rest of the server: no new requirements.
 """
 
+import json
 import os
 import time
-import requests
+import urllib.error
+import urllib.parse
+import urllib.request
 
-ESPN_BASE = "https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/{season}/segments/0/leagues/{league_id}"
+ESPN_BASE = ("https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/"
+             "seasons/{season}/segments/0/leagues/{league_id}")
 DEFAULT_SEASON = int(os.environ.get("ESPN_SEASON", "2026"))
+DEFAULT_ESPN_LEAGUE = os.environ.get("ESPN_LEAGUE_ID", "167814011")
+DEFAULT_ESPN_TEAM = int(os.environ.get("ESPN_TEAM_ID", "4"))
 
 POS = {1: "QB", 2: "RB", 3: "WR", 4: "TE", 5: "K", 16: "D/ST"}
 SLOT = {0: "QB", 2: "RB", 3: "RB/WR", 4: "WR", 6: "TE", 16: "D/ST", 17: "K",
@@ -41,42 +46,45 @@ def _fetch(league_id: str, season: int, week: int) -> dict:
     hit = _cache.get(key)
     if hit and time.time() - hit[0] < CACHE_SECONDS:
         return hit[1]
-    params = [("view", "mTeam"), ("view", "mRoster"), ("view", "mMatchup"), ("view", "mSettings")]
+    params = [("view", "mTeam"), ("view", "mRoster"),
+              ("view", "mMatchup"), ("view", "mSettings")]
     if week:
         params.append(("scoringPeriodId", str(week)))
-    cookies = {}
-    if os.environ.get("ESPN_S2") and os.environ.get("ESPN_SWID"):
-        cookies = {"espn_s2": os.environ["ESPN_S2"], "SWID": os.environ["ESPN_SWID"]}
-    r = requests.get(ESPN_BASE.format(season=season, league_id=league_id),
-                     params=params, cookies=cookies, timeout=20,
-                     headers={"User-Agent": "Mozilla/5.0"})
-    if r.status_code == 401:
-        raise RuntimeError("ESPN 401: private league. Set ESPN_S2 and ESPN_SWID on Render.")
-    r.raise_for_status()
-    data = r.json()
+    url = ESPN_BASE.format(season=season, league_id=league_id) + "?" + \
+        urllib.parse.urlencode(params)
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    s2, swid = os.environ.get("ESPN_S2", ""), os.environ.get("ESPN_SWID", "")
+    if s2 and swid:
+        headers["Cookie"] = f"espn_s2={s2}; SWID={swid}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode())
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise RuntimeError("ESPN 401: private league. Set ESPN_S2 and ESPN_SWID "
+                               "on Render (cookies from a logged-in espn.com tab).")
+        raise
     _cache[key] = (time.time(), data)
     return data
 
 
 def _team_name(t: dict) -> str:
-    return t.get("name") or f"{t.get('location', '')} {t.get('nickname', '')}".strip() or f"Team {t['id']}"
+    return (t.get("name")
+            or f"{t.get('location', '')} {t.get('nickname', '')}".strip()
+            or f"Team {t['id']}")
 
 
 def _record(t: dict) -> str:
     o = (t.get("record") or {}).get("overall") or {}
-    return f"{o.get('wins', 0)}-{o.get('losses', 0)}" + (f"-{o['ties']}" if o.get("ties") else "")
+    rec = f"{o.get('wins', 0)}-{o.get('losses', 0)}"
+    return rec + (f"-{o['ties']}" if o.get("ties") else "")
 
 
-def _projection(player: dict, week: int) -> float | None:
+def _stat(player: dict, week: int, source: int):
+    """source 1 = ESPN projection, 0 = actual points."""
     for s in player.get("stats") or []:
-        if s.get("statSourceId") == 1 and s.get("scoringPeriodId") == week:
-            return round(s.get("appliedTotal", 0.0), 1)
-    return None
-
-
-def _actual(player: dict, week: int) -> float | None:
-    for s in player.get("stats") or []:
-        if s.get("statSourceId") == 0 and s.get("scoringPeriodId") == week:
+        if s.get("statSourceId") == source and s.get("scoringPeriodId") == week:
             return round(s.get("appliedTotal", 0.0), 1)
     return None
 
@@ -91,8 +99,8 @@ def _render_team(t: dict, week: int) -> str:
             "pos": POS.get(p.get("defaultPositionId"), "?"),
             "team": PRO.get(p.get("proTeamId"), str(p.get("proTeamId"))),
             "inj": p.get("injuryStatus") or ("OUT" if p.get("injured") else "ACTIVE"),
-            "proj": _projection(p, week),
-            "pts": _actual(p, week),
+            "proj": _stat(p, week, 1),
+            "pts": _stat(p, week, 0),
         })
     rows.sort(key=lambda r: SLOT_ORDER.index(r["slot"]) if r["slot"] in SLOT_ORDER else 99)
     lines = [f"## {_team_name(t)} (team {t['id']}, {_record(t)})"]
@@ -107,38 +115,44 @@ def _render_team(t: dict, week: int) -> str:
 def register_espn_tools(mcp):
 
     @mcp.tool()
-    def espn_roster(league_id: str, team_id: int, week: int = 0, season: int = 0) -> str:
+    def espn_roster(team_id: int = 0, league_id: str = "", week: int = 0,
+                    season: int = 0) -> str:
         """One ESPN team's roster: lineup slot, position, NFL team, injury status,
-        ESPN projection and live points for the week. week=0 means current week.
-        Private leagues need ESPN_S2 and ESPN_SWID set in the environment."""
-        data = _fetch(league_id, season or DEFAULT_SEASON, week)
+        ESPN projection and live points. Defaults: MORPHEUS league 167814011,
+        my team 4, current week. Pass team_id for any other team."""
+        lid = league_id or DEFAULT_ESPN_LEAGUE
+        data = _fetch(lid, season or DEFAULT_SEASON, week)
         wk = week or data.get("scoringPeriodId")
-        team = next((t for t in data.get("teams", []) if t["id"] == team_id), None)
+        tid = team_id or DEFAULT_ESPN_TEAM
+        team = next((t for t in data.get("teams", []) if t["id"] == tid), None)
         if not team:
-            return f"No team {team_id} in league {league_id}."
-        return f"Week {wk}\n" + _render_team(team, wk)
+            return f"No team {tid} in ESPN league {lid}."
+        return f"ESPN league {lid} · week {wk}\n" + _render_team(team, wk)
 
     @mcp.tool()
-    def espn_matchup(league_id: str, team_id: int, week: int = 0, season: int = 0) -> str:
-        """Head-to-head view for an ESPN league: finds team_id's opponent for the
-        week and returns BOTH full rosters with slots, injuries, projections and
-        live points. week=0 means current week. This is the weekly start/sit tool
-        for ESPN leagues (MORPHEUS: league 167814011, team 4)."""
-        data = _fetch(league_id, season or DEFAULT_SEASON, week)
+    def espn_matchup(team_id: int = 0, league_id: str = "", week: int = 0,
+                     season: int = 0) -> str:
+        """THE WEEKLY TOOL FOR ESPN LEAGUES. Finds this week's opponent and returns
+        BOTH full rosters with slots, injuries, ESPN projections and live points.
+        Defaults: MORPHEUS league 167814011, my team 4, current week."""
+        lid = league_id or DEFAULT_ESPN_LEAGUE
+        data = _fetch(lid, season or DEFAULT_SEASON, week)
         wk = week or data.get("scoringPeriodId")
+        tid = team_id or DEFAULT_ESPN_TEAM
         teams = {t["id"]: t for t in data.get("teams", [])}
-        opp_id = None
+        if tid not in teams:
+            return f"No team {tid} in ESPN league {lid}."
+        opp = None
         for m in data.get("schedule", []):
             if m.get("matchupPeriodId") != wk:
                 continue
-            h, a = (m.get("home") or {}).get("teamId"), (m.get("away") or {}).get("teamId")
-            if h == team_id:
-                opp_id = a
-            elif a == team_id:
-                opp_id = h
-        out = [f"Week {wk}", _render_team(teams[team_id], wk)]
-        if opp_id is not None and opp_id in teams:
-            out.append(_render_team(teams[opp_id], wk))
-        else:
-            out.append("Opponent not found for this week (bye or schedule not loaded).")
+            h = (m.get("home") or {}).get("teamId")
+            a = (m.get("away") or {}).get("teamId")
+            if h == tid:
+                opp = a
+            elif a == tid:
+                opp = h
+        out = [f"ESPN league {lid} · week {wk}", _render_team(teams[tid], wk)]
+        out.append(_render_team(teams[opp], wk) if opp in teams
+                   else "Opponent not found for this week (bye or schedule not loaded).")
         return "\n\n".join(out)
