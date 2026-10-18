@@ -5,3 +5,4 @@
 mcp>=1.9.0,<2.0.0
 starlette>=0.37.0
 uvicorn>=0.30.0
+youtube-transcript-api>=1.2,<2.0

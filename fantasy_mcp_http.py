@@ -1045,6 +1045,96 @@ def refresh_cache(what: str = "all") -> str:
     return f"Cleared {n} cached file(s)."
 
 
+# ----------------------------------------------------------------- youtube
+
+YT_PROXY = os.environ.get("YT_PROXY_URL", "").strip()
+_YT_ID = re.compile(r"(?:v=|youtu\.be/|shorts/|embed/|live/)([A-Za-z0-9_-]{11})")
+
+
+def _yt_id(url_or_id: str) -> str:
+    s = (url_or_id or "").strip()
+    m = _YT_ID.search(s)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", s):
+        return s
+    raise ValueError(f"No YouTube video id in {url_or_id!r}")
+
+
+def _secs(ts: str) -> float | None:
+    """'1:02:30' / '22:56' / '95' -> seconds. Empty -> None."""
+    ts = (ts or "").strip()
+    if not ts:
+        return None
+    total = 0.0
+    for part in ts.split(":"):
+        total = total * 60 + float(part)
+    return total
+
+
+def _hms(sec: float) -> str:
+    s = int(sec)
+    return (f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600
+            else f"{s // 60}:{s % 60:02d}")
+
+
+@mcp.tool()
+def youtube_transcript(url_or_id: str, start: str = "", end: str = "",
+                       language: str = "en") -> str:
+    """Transcript of a YouTube video, grouped into ~30-second timestamped lines.
+
+    start / end: optional window such as "22:56" to "30:56", so one chapter can
+    be pulled instead of a full hour. Transcripts are cached 7 days.
+    If YouTube refuses Render's IP, set YT_PROXY_URL in the environment
+    (http://user:pass@host:port). No code change needed."""
+    # Imported here, not at the top, so a missing package can only break
+    # this one tool, never the rest of the server.
+    from youtube_transcript_api import YouTubeTranscriptApi
+    from youtube_transcript_api.proxies import GenericProxyConfig
+
+    try:
+        vid = _yt_id(url_or_id)
+        lo, hi = _secs(start), _secs(end)
+    except ValueError as exc:
+        return f"youtube_transcript: {exc}"
+
+    p = _cache_path(f"yt_{vid}_{language}")
+    if p.exists() and time.time() - p.stat().st_mtime < 7 * 86400:
+        snips = json.loads(p.read_text())
+    else:
+        api = (YouTubeTranscriptApi(proxy_config=GenericProxyConfig(
+                   http_url=YT_PROXY, https_url=YT_PROXY))
+               if YT_PROXY else YouTubeTranscriptApi())
+        try:
+            fetched = api.fetch(vid, languages=list(dict.fromkeys([language, "en"])))
+        except Exception as exc:
+            return (f"youtube_transcript: {type(exc).__name__} for {vid}. "
+                    "IpBlocked / RequestBlocked = YouTube refused Render's IP; "
+                    "set YT_PROXY_URL.")
+        snips = [{"t": s.start, "x": s.text} for s in fetched]
+        p.write_text(json.dumps(snips))
+
+    sel = [s for s in snips
+           if (lo is None or s["t"] >= lo) and (hi is None or s["t"] < hi)]
+
+    lines, buf, mark = [], [], None
+    for s in sel:
+        if mark is None:
+            mark = s["t"]
+        if s["t"] - mark >= 30 and buf:
+            lines.append(f"[{_hms(mark)}] " + " ".join(buf))
+            buf, mark = [], s["t"]
+        buf.append(s["x"].replace("\n", " "))
+    if buf:
+        lines.append(f"[{_hms(mark)}] " + " ".join(buf))
+
+    total = _hms(snips[-1]["t"]) if snips else "0:00"
+    head = (f"YOUTUBE {vid} · runtime ~{total} · "
+            + (f"window {start or '0:00'}–{end or 'end'}"
+               if lo is not None or hi is not None else "full"))
+    return head + "\n\n" + ("\n".join(lines) or "Nothing in that window.")
+
+
 # ----------------------------------------------------------------- auth + app
 
 OPEN_PATHS = {"/healthz"}
