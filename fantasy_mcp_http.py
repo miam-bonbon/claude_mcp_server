@@ -1135,6 +1135,149 @@ def youtube_transcript(url_or_id: str, start: str = "", end: str = "",
     return head + "\n\n" + ("\n".join(lines) or "Nothing in that window.")
 
 
+# ----------------------------------------------------------------- projections
+
+# ALWAYS FULL PPR. Both redraft leagues score 1.0 per reception. The FP
+# projections endpoint defaults to STANDARD when `scoring` is omitted, which
+# would silently hand back the wrong numbers — so scoring is hard-coded here,
+# not a parameter. Each player carries points / points_half / points_ppr; only
+# points_ppr is read. QB, K and DST rows may have no points_ppr field
+# (receptions don't apply), so for those three `points` is used instead.
+# RB/WR/TE rows WITHOUT points_ppr are shown as errors, never as standard.
+
+PROJ_SCORING = "PPR"
+_PROJ_NO_PPR_FIELD = {"QB", "K", "DST"}
+_PROJ_ALL = "QB:RB:WR:TE:K:DST"
+
+
+def _proj_points(pos: str, stats: dict):
+    """(value, ok). Never falls back to standard points for a pass catcher."""
+    if stats.get("points_ppr") is not None:
+        return float(stats["points_ppr"]), True
+    if pos in _PROJ_NO_PPR_FIELD and stats.get("points") is not None:
+        return float(stats["points"]), True
+    return None, False
+
+
+def _proj_line(pos: str, s: dict) -> str:
+    """Short stat line so a projection can be sanity-checked at a glance."""
+    def g(k):
+        v = s.get(k)
+        return float(v) if v not in (None, "") else 0.0
+    if pos == "QB":
+        return (f"{g('pass_yds'):.0f} pass yds · {g('pass_tds'):.1f} TD · "
+                f"{g('pass_ints'):.1f} INT · {g('rush_yds'):.0f} rush yds")
+    if pos in ("RB", "WR", "TE"):
+        parts = []
+        if g("rush_att") or g("rush_yds"):
+            parts.append(f"{g('rush_att'):.1f} car {g('rush_yds'):.0f} yds")
+        parts.append(f"{g('rec_rec'):.1f} rec {g('rec_yds'):.0f} yds")
+        tds = g("rush_tds") + g("rec_tds")
+        parts.append(f"{tds:.2f} TD")
+        return " · ".join(parts)
+    if pos == "K":
+        return f"{g('fg'):.1f} FG · {g('xpt'):.1f} XP"
+    return ""
+
+
+@mcp.tool()
+def fp_projections(players: str = "", position: str = "", week: int = 0,
+                   season: int = 0, limit: int = 60) -> str:
+    """FantasyPros weekly projections — ALWAYS FULL PPR (hard-coded, no override).
+
+    players : comma-separated names, e.g. "Kenneth Walker, Tyler Warren".
+              When given, returns exactly those players (any position) and
+              lists any name it could not find. Best for start/sit.
+    position: QB RB WR TE K DST, or a colon list like "RB:WR:TE". Default all.
+    week    : 0 = current week as FantasyPros defines it.
+    limit   : rows per position when listing a whole position.
+
+    Points are points_ppr (QB/K/DST use points — no receptions involved).
+    The response's scoring is verified to be PPR or the tool refuses to answer."""
+    pos_param = (position or "").strip().upper() or _PROJ_ALL
+    if season <= 0:
+        try:
+            season = fp_profile("")["season"]
+        except Exception:
+            season = 2026
+
+    # One request per position via the documented `position` param (default
+    # there is RB, so a missed param would silently return only RBs).
+    raw, failed, wk = [], [], week or "current"
+    for grp in [g for g in pos_param.split(":") if g]:
+        params = {"scoring": PROJ_SCORING, "position": grp}
+        if week > 0:
+            params["week"] = week
+        try:
+            data = _fp(f"nfl/{season}/projections", params,
+                       cache_key=f"fp_{season}_proj_w{week}_{grp}_{PROJ_SCORING}",
+                       ttl=TTL["rankings"])
+        except Exception as exc:
+            failed.append(f"{grp} ({type(exc).__name__}: {exc})")
+            continue
+        got = str(data.get("scoring") or "").upper()
+        if got and got != PROJ_SCORING:
+            return (f"fp_projections: REFUSED — asked for {PROJ_SCORING}, API "
+                    f"returned scoring={got} for {grp}. No numbers shown rather "
+                    "than wrong ones.")
+        wk = data.get("week", wk)
+        for p in data.get("players", []) or []:
+            p.setdefault("_pos", grp)
+            raw.append(p)
+    if not raw and failed:
+        return "fp_projections: request failed — " + "; ".join(failed)
+
+    rows = []
+    for p in raw:
+        pos = (p.get("position_id") or p.get("player_position_id")
+               or p.get("_pos") or "").upper()
+        name = p.get("name") or p.get("player_name") or ""
+        team = p.get("team_id") or p.get("player_team_id") or ""
+        stats = p.get("stats") or {}
+        pts, ok = _proj_points(pos, stats)
+        rows.append({"name": name, "nm": norm_name(name), "pos": pos,
+                     "team": team, "pts": pts, "ok": ok,
+                     "line": _proj_line(pos, stats)})
+
+    head = (f"FANTASYPROS PROJECTIONS · week {wk} · {season} · "
+            f"scoring {PROJ_SCORING} (points_ppr) · {len(rows)} players")
+    if failed:
+        head += "\n  ! positions unavailable: " + "; ".join(failed)
+
+    def fmt(r):
+        val = f"{r['pts']:5.1f}" if r["ok"] else "  ERR"
+        tail = r["line"] if r["ok"] else "no points_ppr in response — not shown as STD"
+        return f"{val}  {r['pos']:<3} {r['name'][:24]:<25}{r['team']:<4} {tail}"
+
+    if players.strip():
+        wanted = [w.strip() for w in players.split(",") if w.strip()]
+        by_nm = {}
+        for r in rows:
+            by_nm.setdefault(r["nm"], r)
+        hit, miss = [], []
+        for w in wanted:
+            r = by_nm.get(norm_name(w))
+            if r is None:  # loose match: every token of the query in the name
+                toks = norm_name(w)
+                r = next((x for x in rows if toks and toks in x["nm"]), None)
+            (hit if r else miss).append(r or w)
+        hit.sort(key=lambda r: -(r["pts"] or 0))
+        out = [head, ""] + [fmt(r) for r in hit]
+        if miss:
+            out += ["", "NOT FOUND: " + ", ".join(miss)
+                    + " (bye week, inactive, or name mismatch)"]
+        return "\n".join(out)
+
+    out = [head]
+    for grp in [g for g in pos_param.split(":") if g]:
+        block = sorted((r for r in rows if r["pos"] == grp),
+                       key=lambda r: -(r["pts"] or 0))[:limit]
+        if not block:
+            continue
+        out += ["", f"{grp} ({len(block)})"] + [fmt(r) for r in block]
+    return "\n".join(out)
+
+
 # ----------------------------------------------------------------- espn
 
 # MORPHEUS is on ESPN. espn_matchup / espn_roster live in espn_tools.py and
